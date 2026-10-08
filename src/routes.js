@@ -332,5 +332,34 @@ router.all('/readings/:id', (req, res, next) => next(methodNotAllowed(['GET', 'H
 router.all('/readings', (req, res, next) => next(methodNotAllowed(['GET', 'HEAD'])));
 router.all('/installations/:id/readings', (req, res, next) => next(methodNotAllowed(['GET', 'HEAD', 'POST'])));
 
+// ======================= DISTRICT GENERATION SUMMARY (processing resource) =======================
+router.get('/districts/:id/generation-summary', requireUser, (req, res) => {
+  const d = getDistrict(parseId(req.params.id)); assertDistrict(req.user, d);
+  const base = `FROM generation_readings r JOIN installations i ON i.id = r.installation_id JOIN grid_substations s ON s.id = i.substation_id WHERE s.district_id = ?`;
+  const latest = db.prepare(`SELECT MAX(r.timestamp) AS t ${base}`).get(d.id).t;
+  const asOf = req.query.as_of !== undefined ? parseTime(req.query.as_of, 'as_of') : latest;
+  const totalInst = db.prepare('SELECT COUNT(*) AS n FROM installations i JOIN grid_substations s ON s.id = i.substation_id WHERE s.district_id = ?').get(d.id).n;
+  const summary = { district_id: d.id, district_name: d.name, as_of: asOf, window_minutes: 30, installations_total: totalInst, installations_reporting: 0, current_power_kw: 0, energy_today_kwh: 0, day_start: null };
+  if (asOf) {
+    const windowStart = new Date(new Date(asOf).getTime() - 30 * 60 * 1000).toISOString();
+    const dayStart = localDayStart(asOf);
+    const cur = db.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(r.power_kw), 0) AS kw
+      FROM generation_readings r
+      JOIN (SELECT r2.installation_id AS iid, MAX(r2.timestamp) AS ts
+            FROM generation_readings r2 JOIN installations i2 ON i2.id = r2.installation_id
+            JOIN grid_substations s2 ON s2.id = i2.substation_id
+            WHERE s2.district_id = ? AND r2.timestamp <= ? AND r2.timestamp > ?
+            GROUP BY r2.installation_id) l ON l.iid = r.installation_id AND l.ts = r.timestamp`).get(d.id, asOf, windowStart);
+    const en = db.prepare(`SELECT COALESCE(SUM(mx - mn), 0) AS e FROM
+      (SELECT MAX(r.energy_kwh) AS mx, MIN(r.energy_kwh) AS mn ${base} AND r.timestamp >= ? AND r.timestamp <= ? GROUP BY r.installation_id)`).get(d.id, dayStart, asOf);
+    summary.installations_reporting = cur.n;
+    summary.current_power_kw = round(cur.kw);
+    summary.energy_today_kwh = round(en.e);
+    summary.day_start = dayStart;
+  }
+  sendResource(req, res, summary, { lastModified: asOf ?? undefined });
+});
+
+
 
 export default router;
