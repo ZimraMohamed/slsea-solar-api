@@ -144,4 +144,128 @@ router.get('/substations/:id', requireUser, (req, res) => {
   sendResource(req, res, s);
 });
 
+// ======================= INSTALLATIONS =======================
+function installationsList(req, res, forced = {}) {
+  const f = geoFilters(req, forced, ['province_id', 'district_id', 'substation_id']);
+  const sc = scopeClause(req.user);
+  const where = [...f.where, sc.sql]; const params = [...f.params, ...sc.params];
+  if (req.query.status !== undefined) {
+    if (!STATUSES.includes(req.query.status)) throw badRequest("Invalid query parameter 'status'", [{ field: 'status', issue: `must be one of ${STATUSES.join(', ')}` }]);
+    where.push('i.status = ?'); params.push(req.query.status);
+  }
+  paged(req, res, { select: INST_SELECT, from: GEO_I, where, params, order: 'i.id' });
+}
+router.get('/installations', requireUser, (req, res) => installationsList(req, res));
+router.get('/districts/:id/installations', requireUser, (req, res) => {
+  const d = getDistrict(parseId(req.params.id)); assertDistrict(req.user, d);
+  installationsList(req, res, { district_id: d.id });
+});
+router.get('/substations/:id/installations', requireUser, (req, res) => {
+  const s = getSubstation(parseId(req.params.id)); assertSubstation(req.user, s);
+  installationsList(req, res, { substation_id: s.id });
+});
+
+router.get('/installations/:id', requireUser, (req, res) => {
+  const inst = getInstallation(parseId(req.params.id)); assertInstallation(req.user, inst);
+  sendResource(req, res, inst, { etag: instEtag(inst), lastModified: inst.updated_at });
+});
+
+function validateInstallation(body, { creating }) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw badRequest('Request body must be a JSON object');
+  const b = body; const errs = [];
+  if (typeof b.name !== 'string' || !b.name.trim() || b.name.length > 100) errs.push({ field: 'name', issue: 'required string, 1-100 chars' });
+  if ((creating || b.meter_id !== undefined) && (typeof b.meter_id !== 'string' || !/^[A-Za-z0-9_-]{3,40}$/.test(b.meter_id))) {
+    errs.push({ field: 'meter_id', issue: 'required string, 3-40 chars of A-Z a-z 0-9 _ -' });
+  }
+  if (!Number.isInteger(b.substation_id)) errs.push({ field: 'substation_id', issue: 'required integer' });
+  else if (!db.prepare('SELECT 1 FROM grid_substations WHERE id = ?').get(b.substation_id)) errs.push({ field: 'substation_id', issue: 'does not exist' });
+  if (typeof b.capacity_kw !== 'number' || !(b.capacity_kw > 0) || b.capacity_kw > 10000) errs.push({ field: 'capacity_kw', issue: 'required number > 0 and <= 10000' });
+  if (typeof b.installed_on !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(b.installed_on) || Number.isNaN(Date.parse(b.installed_on))) errs.push({ field: 'installed_on', issue: 'required date YYYY-MM-DD' });
+  const status = b.status ?? 'active';
+  if (!STATUSES.includes(status)) errs.push({ field: 'status', issue: `must be one of ${STATUSES.join(', ')}` });
+  if (errs.length) throw badRequest('Installation failed validation', errs);
+  return { meter_id: b.meter_id, name: b.name.trim(), substation_id: b.substation_id, capacity_kw: b.capacity_kw, installed_on: b.installed_on, status };
+}
+
+// CREATE: POST -> 201 + Location (+ ETag). Returns the device key ONCE for provisioning.
+router.post('/installations', requireUser, requireRole('national'), (req, res) => {
+  const v = validateInstallation(req.body, { creating: true });
+  let r;
+  try {
+    r = db.prepare('INSERT INTO installations (meter_id, name, substation_id, capacity_kw, status, installed_on, version, updated_at) VALUES (?,?,?,?,?,?,1,?)')
+      .run(v.meter_id, v.name, v.substation_id, v.capacity_kw, v.status, v.installed_on, new Date().toISOString());
+  } catch (e) {
+    if (/UNIQUE/.test(e.message)) throw conflict('DUPLICATE_METER', 'meter_id is already registered', [{ field: 'meter_id', issue: 'must be unique' }]);
+    throw e;
+  }
+  const inst = getInstallation(Number(r.lastInsertRowid));
+  res.status(201).set({ Location: `/api/v1/installations/${inst.id}`, ETag: instEtag(inst), 'Cache-Control': 'no-store' })
+    .json({ ...inst, device_key: deviceKeyFor(inst.meter_id) });
+});
+
+// UPDATE: PUT = full replacement of mutable fields; idempotent (no version bump if nothing changes).
+router.put('/installations/:id', requireUser, requireRole('national'), (req, res) => {
+  const id = parseId(req.params.id);
+  const cur = getInstallation(id);
+  const ifMatch = req.get('if-match');
+  if (ifMatch && ifMatch !== '*' && ifMatch !== instEtag(cur)) throw preconditionFailed();
+  const v = validateInstallation(req.body, { creating: false });
+  if (v.meter_id !== undefined && v.meter_id !== cur.meter_id) {
+    throw badRequest('meter_id is immutable', [{ field: 'meter_id', issue: 'cannot be changed (it identifies the device credential)' }]);
+  }
+  const changed = ['name', 'substation_id', 'capacity_kw', 'installed_on', 'status'].some((k) => v[k] !== cur[k]);
+  if (changed) {
+    db.prepare('UPDATE installations SET name=?, substation_id=?, capacity_kw=?, status=?, installed_on=?, version=version+1, updated_at=? WHERE id=?')
+      .run(v.name, v.substation_id, v.capacity_kw, v.status, v.installed_on, new Date().toISOString(), id);
+  }
+  const inst = getInstallation(id);
+  sendResource(req, res, inst, { etag: instEtag(inst), lastModified: inst.updated_at });
+});
+
+// DELETE: 204. Refused (409) if history exists, because readings are append-only.
+router.delete('/installations/:id', requireUser, requireRole('national'), (req, res) => {
+  const cur = getInstallation(parseId(req.params.id));
+  const ifMatch = req.get('if-match');
+  if (ifMatch && ifMatch !== '*' && ifMatch !== instEtag(cur)) throw preconditionFailed();
+  const n = db.prepare('SELECT COUNT(*) AS n FROM generation_readings WHERE installation_id = ?').get(cur.id).n;
+  if (n > 0) throw conflict('HAS_HISTORY', 'Installation has generation history; set status to "decommissioned" with PUT instead', [{ readings: n }]);
+  db.prepare('DELETE FROM installations WHERE id = ?').run(cur.id);
+  res.status(204).end();
+});
+
+// ---- Composite resource: installation + location + operational snapshot ----
+router.get('/installations/:id/overview', requireUser, (req, res) => {
+  const inst = getInstallation(parseId(req.params.id)); assertInstallation(req.user, inst);
+  const last = db.prepare('SELECT id, timestamp, power_kw, energy_kwh, voltage FROM generation_readings WHERE installation_id = ? ORDER BY timestamp DESC LIMIT 1').get(inst.id) ?? null;
+  const total = db.prepare('SELECT COUNT(*) AS n FROM generation_readings WHERE installation_id = ?').get(inst.id).n;
+  let energyToday = 0;
+  if (last) {
+    const e = db.prepare('SELECT MAX(energy_kwh) - MIN(energy_kwh) AS e FROM generation_readings WHERE installation_id = ? AND timestamp >= ? AND timestamp <= ?')
+      .get(inst.id, localDayStart(last.timestamp), last.timestamp);
+    energyToday = round(e.e ?? 0);
+  }
+  const loc = db.prepare(`SELECT s.id AS substation_id, s.name AS substation_name, d.id AS district_id, d.name AS district_name, p.id AS province_id, p.name AS province_name
+    FROM grid_substations s JOIN districts d ON d.id = s.district_id JOIN provinces p ON p.id = d.province_id WHERE s.id = ?`).get(inst.substation_id);
+  sendResource(req, res, {
+    installation: inst,
+    location: {
+      substation: { id: loc.substation_id, name: loc.substation_name },
+      district: { id: loc.district_id, name: loc.district_name },
+      province: { id: loc.province_id, name: loc.province_name },
+    },
+    last_reading: last,
+    energy_today_kwh: energyToday,
+    total_readings: total,
+  }, { lastModified: last ? last.timestamp : inst.updated_at });
+});
+
+// ---- Derived resource: last-known reading (operational / real-time view) ----
+router.get('/installations/:id/last-reading', requireUser, (req, res) => {
+  const inst = getInstallation(parseId(req.params.id)); assertInstallation(req.user, inst);
+  const last = db.prepare('SELECT id, timestamp, power_kw, energy_kwh, voltage FROM generation_readings WHERE installation_id = ? ORDER BY timestamp DESC LIMIT 1').get(inst.id);
+  if (!last) throw notFound(`Installation ${inst.id} has not reported any readings yet`);
+  sendResource(req, res, { installation_id: inst.id, meter_id: inst.meter_id, ...last }, { lastModified: last.timestamp });
+});
+
+
 export default router;
