@@ -266,6 +266,71 @@ router.get('/installations/:id/last-reading', requireUser, (req, res) => {
   if (!last) throw notFound(`Installation ${inst.id} has not reported any readings yet`);
   sendResource(req, res, { installation_id: inst.id, meter_id: inst.meter_id, ...last }, { lastModified: last.timestamp });
 });
+// ======================= GENERATION READINGS =======================
+// Ingestion: device authenticates AS the installation and may write only to its own sub-collection.
+router.post('/installations/:id/readings', requireDevice, (req, res) => {
+  const id = parseId(req.params.id);
+  const inst = req.device.installation;
+  if (id !== inst.id) throw forbidden('A device may only write readings for its own installation');
+  if (inst.status !== 'active') throw conflict('INSTALLATION_NOT_ACTIVE', `Installation is ${inst.status}`);
+  const b = req.body;
+  if (!b || typeof b !== 'object' || Array.isArray(b)) throw badRequest('Request body must be a JSON object');
+  const errs = [];
+  let ts;
+  if (typeof b.timestamp !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(b.timestamp) || Number.isNaN(Date.parse(b.timestamp))) {
+    errs.push({ field: 'timestamp', issue: 'required ISO-8601 date-time' });
+  } else {
+    ts = new Date(b.timestamp).toISOString();
+    if (new Date(ts).getTime() > Date.now() + 5 * 60 * 1000) errs.push({ field: 'timestamp', issue: 'must not be in the future' });
+  }
+  if (typeof b.power_kw !== 'number' || b.power_kw < 0 || b.power_kw > inst.capacity_kw * 1.2) errs.push({ field: 'power_kw', issue: `required number between 0 and ${round(inst.capacity_kw * 1.2, 2)} (120% of capacity)` });
+  if (typeof b.energy_kwh !== 'number' || b.energy_kwh < 0) errs.push({ field: 'energy_kwh', issue: 'required number >= 0 (cumulative)' });
+  if (typeof b.voltage !== 'number' || b.voltage < 100 || b.voltage > 300) errs.push({ field: 'voltage', issue: 'required number between 100 and 300' });
+  if (errs.length) throw badRequest('Generation reading failed validation', errs);
+  let r;
+  try {
+    r = db.prepare('INSERT INTO generation_readings (installation_id, timestamp, power_kw, energy_kwh, voltage) VALUES (?,?,?,?,?)')
+      .run(inst.id, ts, b.power_kw, b.energy_kwh, b.voltage);
+  } catch (e) {
+    if (/UNIQUE/.test(e.message)) throw conflict('DUPLICATE_READING', 'A reading for this installation and timestamp already exists', [{ field: 'timestamp', issue: 'already recorded' }]);
+    throw e;
+  }
+  const reading = { id: Number(r.lastInsertRowid), installation_id: inst.id, timestamp: ts, power_kw: b.power_kw, energy_kwh: b.energy_kwh, voltage: b.voltage };
+  res.status(201).set({ Location: `/api/v1/readings/${reading.id}`, 'Cache-Control': 'no-store' }).json(reading);
+});
+
+// History: filter by jurisdiction + time window, sort, paginate.
+function readingsList(req, res, forced = {}) {
+  const f = geoFilters(req, forced, ['province_id', 'district_id', 'substation_id', 'installation_id']);
+  const sc = scopeClause(req.user);
+  const where = [...f.where, sc.sql]; const params = [...f.params, ...sc.params];
+  const from = req.query.from !== undefined ? parseTime(req.query.from, 'from') : null;
+  const to = req.query.to !== undefined ? parseTime(req.query.to, 'to') : null;
+  if (from && to && from > to) throw badRequest("'from' must not be after 'to'", [{ field: 'from', issue: 'later than to' }]);
+  if (from) { where.push('r.timestamp >= ?'); params.push(from); }
+  if (to) { where.push('r.timestamp <= ?'); params.push(to); }
+  const sort = req.query.sort ?? 'timestamp';
+  if (!SORTABLE.includes(sort)) throw badRequest("Invalid query parameter 'sort'", [{ field: 'sort', issue: `must be one of ${SORTABLE.join(', ')}` }]);
+  const order = String(req.query.order ?? 'desc').toLowerCase();
+  if (!['asc', 'desc'].includes(order)) throw badRequest("Invalid query parameter 'order'", [{ field: 'order', issue: 'must be asc or desc' }]);
+  paged(req, res, { select: R_SELECT, from: R_FROM, where, params, order: `r.${sort} ${order}, r.id ${order}` });
+}
+router.get('/installations/:id/readings', requireUser, (req, res) => {
+  const inst = getInstallation(parseId(req.params.id)); assertInstallation(req.user, inst);
+  readingsList(req, res, { installation_id: inst.id });
+});
+router.get('/readings', requireUser, (req, res) => readingsList(req, res));
+router.get('/readings/:id', requireUser, (req, res) => {
+  const r = must(db.prepare('SELECT id, installation_id, timestamp, power_kw, energy_kwh, voltage FROM generation_readings WHERE id = ?').get(parseId(req.params.id)), 'Reading', req.params.id);
+  assertInstallation(req.user, getInstallation(r.installation_id));
+  // readings are immutable -> strong ETag + Last-Modified = the reading's own timestamp
+  sendResource(req, res, r, { etag: `"reading-${r.id}"`, lastModified: r.timestamp });
+});
+
+// Append-only: no update / delete of readings
+router.all('/readings/:id', (req, res, next) => next(methodNotAllowed(['GET', 'HEAD'])));
+router.all('/readings', (req, res, next) => next(methodNotAllowed(['GET', 'HEAD'])));
+router.all('/installations/:id/readings', (req, res, next) => next(methodNotAllowed(['GET', 'HEAD', 'POST'])));
 
 
 export default router;
