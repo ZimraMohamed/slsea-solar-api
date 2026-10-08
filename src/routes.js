@@ -93,4 +93,55 @@ router.post('/auth/login', (req, res) => {
   });
 });
 
+// ======================= PROVINCES =======================
+router.get('/provinces', requireUser, (req, res) => {
+  const where = []; const params = [];
+  if (req.user.role !== 'national') { where.push('id = ?'); params.push(req.user.province_id); }
+  paged(req, res, { select: 'SELECT id, name', from: 'FROM provinces', where, params, order: 'id' });
+});
+router.get('/provinces/:id', requireUser, (req, res) => {
+  const p = getProvince(parseId(req.params.id)); assertProvince(req.user, p);
+  sendResource(req, res, p);
+});
+
+// ======================= DISTRICTS =======================
+function districtsList(req, res, forced = {}) {
+  const f = geoFilters(req, forced, ['province_id']);
+  const sc = scopeClause(req.user);
+  paged(req, res, {
+    select: 'SELECT d.id, d.name, d.province_id',
+    from: 'FROM districts d JOIN provinces p ON p.id = d.province_id',
+    where: [...f.where, sc.sql], params: [...f.params, ...sc.params], order: 'd.id',
+  });
+}
+router.get('/districts', requireUser, (req, res) => districtsList(req, res));
+router.get('/provinces/:id/districts', requireUser, (req, res) => {
+  const p = getProvince(parseId(req.params.id)); assertProvince(req.user, p);
+  districtsList(req, res, { province_id: p.id });
+});
+router.get('/districts/:id', requireUser, (req, res) => {
+  const d = getDistrict(parseId(req.params.id)); assertDistrict(req.user, d);
+  sendResource(req, res, d);
+});
+
+// ======================= GRID SUBSTATIONS =======================
+function substationsList(req, res, forced = {}) {
+  const f = geoFilters(req, forced, ['province_id', 'district_id']);
+  const sc = scopeClause(req.user);
+  paged(req, res, {
+    select: 'SELECT s.id, s.name, s.voltage_kv, s.district_id',
+    from: 'FROM grid_substations s JOIN districts d ON d.id = s.district_id JOIN provinces p ON p.id = d.province_id',
+    where: [...f.where, sc.sql], params: [...f.params, ...sc.params], order: 's.id',
+  });
+}
+router.get('/substations', requireUser, (req, res) => substationsList(req, res));
+router.get('/districts/:id/substations', requireUser, (req, res) => {
+  const d = getDistrict(parseId(req.params.id)); assertDistrict(req.user, d);
+  substationsList(req, res, { district_id: d.id });
+});
+router.get('/substations/:id', requireUser, (req, res) => {
+  const s = getSubstation(parseId(req.params.id)); assertSubstation(req.user, s);
+  sendResource(req, res, s);
+});
+
 export default router;
