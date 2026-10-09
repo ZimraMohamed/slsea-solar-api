@@ -1,3 +1,5 @@
+// src/server.js
+
 import app from './app.js';
 import { seedDatabase } from './seed.js';
 

@@ -1,3 +1,5 @@
+// src/errors.js
+
 // One error contract for the whole API:
 // { "error": { code, message, details[], status, path, timestamp } }
 export class ApiError extends Error {

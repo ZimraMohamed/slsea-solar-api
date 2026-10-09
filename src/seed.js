@@ -1,3 +1,4 @@
+// src/seed.js
 import { pathToFileURL } from 'node:url';
 import { db, tx } from './db.js';
 import { hashPassword } from './auth.js';
