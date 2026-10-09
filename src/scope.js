@@ -1,5 +1,4 @@
 // src/scope.js
-
 // Jurisdiction scoping. SQL fragments assume aliases: p = provinces, d = districts.
 export function scopeClause(u) {
   switch (u.role) {

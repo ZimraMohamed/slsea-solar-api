@@ -1,5 +1,4 @@
 // src/openapi.js
-
 // OpenAPI 3.0 description, served at /openapi.json and rendered at /docs
 const ref = (n) => ({ $ref: `#/components/schemas/${n}` });
 const errRes = (description) => ({ description, content: { 'application/json': { schema: ref('Error') } } });

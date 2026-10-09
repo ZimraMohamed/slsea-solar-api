@@ -1,5 +1,4 @@
 // src/auth.js
-
 import crypto from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import { db } from './db.js';

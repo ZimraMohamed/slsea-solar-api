@@ -1,5 +1,4 @@
 // src/app.js
-
 import express from 'express';
 import swaggerUi from 'swagger-ui-express';
 import router from './routes.js';

@@ -1,5 +1,4 @@
 // src/routes.js
-
 import express from 'express';
 import { db } from './db.js';
 import { ApiError, badRequest, conflict, forbidden, methodNotAllowed, notFound, preconditionFailed } from './errors.js';
