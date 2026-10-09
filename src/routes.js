@@ -361,6 +361,19 @@ router.get('/districts/:id/generation-summary', requireUser, (req, res) => {
   sendResource(req, res, summary, { lastModified: asOf ?? undefined });
 });
 
-
+// ======================= API ROOT =======================
+router.get('/', (req, res) => {
+  res.json({
+    name: 'SLSEA Real-Time Solar Generation Data API',
+    version: '1.0.0',
+    documentation: '/docs',
+    openapi: '/openapi.json',
+    authentication: {
+      users: 'POST /api/v1/auth/login, then Authorization: Bearer <token>',
+      devices: 'Authorization: Device <meter_id>:<device_key>',
+    },
+    resources: ['/provinces', '/districts', '/substations', '/installations', '/readings'],
+  });
+});
 
 export default router;
